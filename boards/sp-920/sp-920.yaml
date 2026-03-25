@@ -1,0 +1,7 @@
+board:
+    soc: HPM6750
+    device: HPM6754xVMx
+    on-board-ram:
+      type: sdram
+      size: 64M
+      width: 32bit
