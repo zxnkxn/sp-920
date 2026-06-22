@@ -313,34 +313,50 @@
 /* DAO section */
 #define BOARD_DAO_I2S_DMA_REQ         (HPM_DMA_SRC_I2S1_TX)
 
-/* enet section */
-#define BOARD_ENET_COUNT         (2U)
-#define BOARD_ENET_PPS           HPM_ENET0
-#define BOARD_ENET_PPS_IDX       enet_pps_0
-#define BOARD_ENET_PPS_PTP_CLOCK clock_ptp0
-
-#define BOARD_ENET_AUXI_SNAPSHOT           HPM_ENET0
-#define BOARD_ENET_AUXI_SNAPSHOT_IDX       enet_ptp_auxi_snapshot_trigger_1
-#define BOARD_ENET_AUXI_SNAPSHOT_PTP_CLOCK clock_ptp0
-
-#define BOARD_ENET_RGMII_PHY_ITF        enet_inf_rgmii
-#define BOARD_ENET_RGMII_RST_GPIO       HPM_GPIO0
-#define BOARD_ENET_RGMII_RST_GPIO_INDEX GPIO_DO_GPIOF
-#define BOARD_ENET_RGMII_RST_GPIO_PIN   (0U)
-#define BOARD_ENET_RGMII                HPM_ENET0
-#define BOARD_ENET_RGMII_TX_DLY         (0U)
-#define BOARD_ENET_RGMII_RX_DLY         (7U)
-#define BOARD_ENET_RGMII_PTP_CLOCK      (clock_ptp0)
-#define BOARD_ENET_RGMII_PPS0_PINOUT    (1)
-
-#define BOARD_ENET_RMII_PHY_ITF        enet_inf_rmii
-#define BOARD_ENET_RMII_RST_GPIO       HPM_GPIO0
-#define BOARD_ENET_RMII_RST_GPIO_INDEX GPIO_DO_GPIOE
-#define BOARD_ENET_RMII_RST_GPIO_PIN   (26U)
-#define BOARD_ENET_RMII                HPM_ENET1
-#define BOARD_ENET_RMII_INT_REF_CLK    enet_phy_rmii_refclk_dir_in
-#define BOARD_ENET_RMII_PTP_CLOCK      (clock_ptp1)
-#define BOARD_ENET_RMII_PPS0_PINOUT    (0)
+// Modified for SP-920
+/* ethernet section - SP-920 custom dual RMII + KSZ8463FRLI */
+#define BOARD_ENET_COUNT (2U)
+// ENET instances
+#define BOARD_ENET0_BASE HPM_ENET0
+#define BOARD_ENET1_BASE HPM_ENET1
+// Both external switches are connected to HPM by RMII
+#define BOARD_ENET0_PHY_ITF enet_inf_rmii
+#define BOARD_ENET1_PHY_ITF enet_inf_rmii
+// RMII reference clocks are provided externally by the board
+#define BOARD_ENET0_REF_CLK_NAME clock_eth0
+#define BOARD_ENET1_REF_CLK_NAME clock_eth1
+// ENET interrupt definitions
+#define BOARD_ENET0_IRQn IRQn_ENET0
+#define BOARD_ENET1_IRQn IRQn_ENET1
+// DMA burst length
+#define BOARD_ENET_DMASYS_BURST_LEN enet_burst_len_32
+// KSZ8463 SPI interface: SPI0 on PZ02/PZ03/PZ04/PZ05
+#define BOARD_KSZ_SPI_BASE        HPM_SPI0
+#define BOARD_KSZ_SPI_CLK_NAME    clock_spi0
+// KSZ8463 chip select pins
+#define BOARD_KSZ0_CS_GPIO        HPM_GPIO0
+#define BOARD_KSZ0_CS_GPIO_INDEX  GPIO_DI_GPIOZ
+#define BOARD_KSZ0_CS_GPIO_PIN    (2U)   // PZ02 = SPI_ETH_CS1
+#define BOARD_KSZ1_CS_GPIO        HPM_GPIO0
+#define BOARD_KSZ1_CS_GPIO_INDEX  GPIO_DI_GPIOZ
+#define BOARD_KSZ1_CS_GPIO_PIN    (8U)   // PZ08 = SPI_ETH_CS2
+// KSZ8463 reset pins
+#define BOARD_KSZ0_RST_GPIO       HPM_GPIO0
+#define BOARD_KSZ0_RST_GPIO_INDEX GPIO_DI_GPIOA
+#define BOARD_KSZ0_RST_GPIO_PIN   (14U)  // PA14 = SW1_RST
+#define BOARD_KSZ1_RST_GPIO       HPM_GPIO0
+#define BOARD_KSZ1_RST_GPIO_INDEX GPIO_DI_GPIOA
+#define BOARD_KSZ1_RST_GPIO_PIN   (17U)  // PA17 = SW2_RST
+// KSZ8463 interrupt pins
+#define BOARD_KSZ0_INT_GPIO       HPM_GPIO0
+#define BOARD_KSZ0_INT_GPIO_INDEX GPIO_DI_GPIOA
+#define BOARD_KSZ0_INT_GPIO_PIN   (15U)  // PA15 = ETH0_INT
+#define BOARD_KSZ1_INT_GPIO       HPM_GPIO0
+#define BOARD_KSZ1_INT_GPIO_INDEX GPIO_DI_GPIOA
+#define BOARD_KSZ1_INT_GPIO_PIN   (18U)  // PA18 = ETH1_INT
+// KSZ8463 expected SPI mode
+#define BOARD_KSZ_SPI_MODE        spi_master_mode
+#define BOARD_KSZ_SPI_DATA_WIDTH  (8U)
 
 /* ADC section */
 #define BOARD_APP_ADC12_NAME     "ADC0"
@@ -753,13 +769,20 @@ hpm_stat_t board_enable_enet_irq(ENET_Type *ptr);
 hpm_stat_t board_disable_enet_irq(ENET_Type *ptr);
 
 #if defined(ENET_MULTIPLE_PORT) && ENET_MULTIPLE_PORT
+
+// SP-920 ENET / KSZ8463 helpers
 hpm_stat_t board_init_multiple_enet_pins(void);
-hpm_stat_t board_init_multiple_enet_clock(void);
 hpm_stat_t board_reset_multiple_enet_phy(void);
 hpm_stat_t board_init_enet_phy(ENET_Type *ptr);
+hpm_stat_t board_init_multiple_enet_clock(void);
+
+void board_init_ksz_spi_pins(void);
+void board_init_ksz_ctrl_pins(void);
+
 ENET_Type *board_get_enet_base(uint8_t idx);
 uint8_t board_get_enet_phy_itf(uint8_t idx);
 void board_get_enet_phy_status(uint8_t idx, void *status);
+
 #endif
 
 /*

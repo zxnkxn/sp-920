@@ -6,9 +6,10 @@ Project for the custom SP-920 board (HPM6754) using HPM SDK.
 
 ## Features
 - SDRAM test (March algorithms)
-- EEPROM MAC read (I2C)
+- EEPROM MAC address read (I2C)
 - RS-485 test
 - Clock test
+- lwIP-based Ethernet communication
 
 ## Requirements
 - CMake
@@ -35,6 +36,6 @@ HPM SDK repository:
 Run the following commands from the **project root directory** (where `CMakeLists.txt` is located):
 
 ```bash
-cmake -G Ninja -B build -S . -DBOARD=sp-920 -DBOARD_SEARCH_PATH="<path-to-project>/boards" -DCMAKE_BUILD_TYPE=debug
+cmake -G Ninja -B build -S . -DBOARD=sp-920 -DBOARD_SEARCH_PATH="<path-to-project>/boards" -DCMAKE_BUILD_TYPE=debug -DHPM_BUILD_TYPE=flash_xip
 cmake --build build
 ```

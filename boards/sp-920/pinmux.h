@@ -26,6 +26,7 @@ void init_uart0_pins(void);
 void init_uart1_pins(void); // Added for SP-920
 void init_uart2_pins(void);
 void init_uart3_pins(void); // Added for SP-920
+void init_uart7_pins(void);
 void init_uart13_pins(void);
 void init_puart_pins(void);
 void init_rs485_2_dir_pin(void); // Added for SP-920
@@ -38,6 +39,10 @@ void init_i2c0_pins(void);
 void init_femc_pins(void);
 void init_gpio_pins_with_pull_up(void);
 void init_gpio_pins_using_gpio0(void);
+void init_spi0_pins(void); // Added for SP-920
+void init_spi_eth_cs_pins(void); // Added for SP-920
+void init_ksz_reset_pins(void); // Added for SP-920
+void init_ksz_interrupt_pins(void); // Added for SP-920
 void init_spi2_pins(void);
 void init_spi2_pins_with_gpio_as_cs(void);
 void init_gptmr3_pins(void);

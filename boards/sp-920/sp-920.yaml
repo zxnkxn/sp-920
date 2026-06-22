@@ -1,6 +1,9 @@
 board:
     soc: HPM6750
     device: HPM6754xVMx
+    on-board-flash:
+      type: xpi_nor
+      size: 128M
     on-board-ram:
       type: sdram
       size: 64M

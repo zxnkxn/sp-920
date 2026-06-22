@@ -25,6 +25,10 @@
 #include "hpm_pcfg_drv.h"
 #include "hpm_sdk_version.h"
 
+// Added for SP-920
+#include <string.h>
+#include "ksz8463.h"
+
 #if defined(ENET_MULTIPLE_PORT) && ENET_MULTIPLE_PORT
 #include "hpm_enet_phy_common.h"
 #endif
@@ -82,8 +86,12 @@
  *    [7:0] Flash Size Option
  *      0 - 4MB / 1 - 8MB / 2 - 16MB
  */
+//#if defined(FLASH_XIP) && FLASH_XIP
+//__attribute__ ((section(".nor_cfg_option"), used)) const uint32_t option[4] = {0xfcf90002, 0x00000007, 0xE, 0x0};
+//#endif
+
 #if defined(FLASH_XIP) && FLASH_XIP
-__attribute__ ((section(".nor_cfg_option"), used)) const uint32_t option[4] = {0xfcf90002, 0x00000007, 0xE, 0x0};
+__attribute__ ((section(".nor_cfg_option"), used)) const uint32_t option[4] = {0xfcf90002, 0x00000007, 0x1000, 0x0};
 #endif
 
 #if defined(FLASH_UF2) && FLASH_UF2
@@ -477,6 +485,9 @@ uint32_t board_init_uart_clock(UART_Type *ptr)
     } else if (ptr == HPM_UART6) {
         clock_add_to_group(clock_uart6, 0);
         freq = clock_get_frequency(clock_uart6);
+    } else if (ptr == HPM_UART7) {
+        clock_add_to_group(clock_uart7, 0);
+        freq = clock_get_frequency(clock_uart7);
     } else if (ptr == HPM_UART13) {
         clock_add_to_group(clock_uart13, 0);
         freq = clock_get_frequency(clock_uart13);
@@ -491,7 +502,10 @@ uint32_t board_init_uart_clock(UART_Type *ptr)
 
 uint32_t board_init_spi_clock(SPI_Type *ptr)
 {
-    if (ptr == HPM_SPI2) {
+    if (ptr == HPM_SPI0) {
+        clock_add_to_group(clock_spi0, 0);
+        return clock_get_frequency(clock_spi0);
+    } else if (ptr == HPM_SPI2) {
         clock_add_to_group(clock_spi2, 0);
         return clock_get_frequency(clock_spi2);
     }
@@ -1094,21 +1108,22 @@ hpm_stat_t board_init_enet_ptp_clock(ENET_Type *ptr)
 
 hpm_stat_t board_init_enet_rmii_reference_clock(ENET_Type *ptr, bool internal)
 {
-    clock_name_t eth_clk = (ptr == HPM_ENET0) ? clock_eth0 : clock_eth1;
+    clock_name_t eth_clk;
 
-    /* Configure Enet clock to output reference clock */
-    clock_add_to_group(eth_clk, BOARD_RUNNING_CORE & 0x1);
-    if (internal) {
-        /* set pll output frequency at 1GHz */
-        if (pllctl_init_int_pll_with_freq(HPM_PLLCTL, PLLCTL_PLL_PLL2, 1000000000UL) == status_success) {
-            /* set pll2_clk1 output frequency at 250MHz from PLL2 divided by 4 */
-            pllctl_set_div(HPM_PLLCTL, PLLCTL_PLL_PLL2, 1, 4);
-            /* set eth clock frequency at 50MHz for enet0 */
-            clock_set_source_divider(eth_clk, clk_src_pll2_clk1, 5);
-        } else {
-            return status_fail;
-        }
+    if (ptr == HPM_ENET0) {
+        eth_clk = clock_eth0;
+    } else if (ptr == HPM_ENET1) {
+        eth_clk = clock_eth1;
+    } else {
+        return status_invalid_argument;
     }
+
+    /*
+     * Even when RMII reference clock is external, the ENET MAC module itself
+     * still needs its peripheral clock enabled/configured.
+     */
+    clock_set_source_divider(eth_clk, clk_src_pll1_clk1, 8);
+    clock_add_to_group(eth_clk, BOARD_RUNNING_CORE & 0x1);
 
     enet_rmii_enable_clock(ptr, internal);
 
@@ -1117,39 +1132,64 @@ hpm_stat_t board_init_enet_rmii_reference_clock(ENET_Type *ptr, bool internal)
 
 hpm_stat_t board_init_enet_rgmii_clock_delay(ENET_Type *ptr)
 {
-    if (ptr == HPM_ENET0) {
-        clock_add_to_group(clock_eth0, BOARD_RUNNING_CORE & 0x1);
-        return enet_rgmii_set_clock_delay(ptr, BOARD_ENET_RGMII_TX_DLY, BOARD_ENET_RGMII_RX_DLY);
-    }
-
-    return status_invalid_argument;
+    (void)ptr;
+    return status_success;
 }
 
 hpm_stat_t board_init_enet_pins(ENET_Type *ptr)
 {
     init_enet_pins(ptr);
-
-    if (ptr == HPM_ENET0) {
-        gpio_set_pin_output_with_initial(BOARD_ENET_RGMII_RST_GPIO, BOARD_ENET_RGMII_RST_GPIO_INDEX, BOARD_ENET_RGMII_RST_GPIO_PIN, 0);
-    } else if (ptr == HPM_ENET1) {
-        gpio_set_pin_output_with_initial(BOARD_ENET_RMII_RST_GPIO, BOARD_ENET_RMII_RST_GPIO_INDEX, BOARD_ENET_RMII_RST_GPIO_PIN, 0);
-    } else {
-        return status_invalid_argument;
-    }
-
     return status_success;
 }
 
 hpm_stat_t board_reset_enet_phy(ENET_Type *ptr)
 {
     if (ptr == HPM_ENET0) {
-        gpio_write_pin(BOARD_ENET_RGMII_RST_GPIO, BOARD_ENET_RGMII_RST_GPIO_INDEX, BOARD_ENET_RGMII_RST_GPIO_PIN, 0);
-        board_delay_ms(1);
-        gpio_write_pin(BOARD_ENET_RGMII_RST_GPIO, BOARD_ENET_RGMII_RST_GPIO_INDEX, BOARD_ENET_RGMII_RST_GPIO_PIN, 1);
+        //printf("Reset KSZ0...\r\n");
+
+        gpio_write_pin(BOARD_KSZ0_RST_GPIO,
+                       BOARD_KSZ0_RST_GPIO_INDEX,
+                       BOARD_KSZ0_RST_GPIO_PIN,
+                       1);
+        board_delay_ms(10);
+
+        gpio_write_pin(BOARD_KSZ0_RST_GPIO,
+                       BOARD_KSZ0_RST_GPIO_INDEX,
+                       BOARD_KSZ0_RST_GPIO_PIN,
+                       0);
+        board_delay_ms(50);
+
+        gpio_write_pin(BOARD_KSZ0_RST_GPIO,
+                       BOARD_KSZ0_RST_GPIO_INDEX,
+                       BOARD_KSZ0_RST_GPIO_PIN,
+                       1);
+        board_delay_ms(100);
+
+        //printf("KSZ0 RST requested HIGH\r\n");
+
     } else if (ptr == HPM_ENET1) {
-        gpio_write_pin(BOARD_ENET_RMII_RST_GPIO, BOARD_ENET_RMII_RST_GPIO_INDEX, BOARD_ENET_RMII_RST_GPIO_PIN, 0);
-        board_delay_ms(1);
-        gpio_write_pin(BOARD_ENET_RMII_RST_GPIO, BOARD_ENET_RMII_RST_GPIO_INDEX, BOARD_ENET_RMII_RST_GPIO_PIN, 1);
+        //printf("Reset KSZ1...\r\n");
+
+        gpio_write_pin(BOARD_KSZ1_RST_GPIO,
+                       BOARD_KSZ1_RST_GPIO_INDEX,
+                       BOARD_KSZ1_RST_GPIO_PIN,
+                       1);
+        board_delay_ms(10);
+
+        gpio_write_pin(BOARD_KSZ1_RST_GPIO,
+                       BOARD_KSZ1_RST_GPIO_INDEX,
+                       BOARD_KSZ1_RST_GPIO_PIN,
+                       0);
+        board_delay_ms(50);
+
+        gpio_write_pin(BOARD_KSZ1_RST_GPIO,
+                       BOARD_KSZ1_RST_GPIO_INDEX,
+                       BOARD_KSZ1_RST_GPIO_PIN,
+                       1);
+        board_delay_ms(100);
+
+        //printf("KSZ1 RST requested HIGH\r\n");
+
     } else {
         return status_invalid_argument;
     }
@@ -1203,61 +1243,75 @@ void board_init_enet_pps_capture_pins(ENET_Type *ptr)
 
 #if defined(ENET_MULTIPLE_PORT) && ENET_MULTIPLE_PORT
 
+// Modified for SP-920
 hpm_stat_t board_init_multiple_enet_pins(void)
 {
+    // Initialize both RMII interfaces
     board_init_enet_pins(HPM_ENET0);
     board_init_enet_pins(HPM_ENET1);
+
+    // Initialize SPI and KSZ8463 control pins
+    board_init_ksz_spi_pins();
+    board_init_ksz_ctrl_pins();
 
     return status_success;
 }
 
 hpm_stat_t board_init_multiple_enet_clock(void)
 {
-    /* Set RGMII clock delay */
-    board_init_enet_rgmii_clock_delay(HPM_ENET0);
+    /* Generate 50 MHz REFCLK0/REFCLK1 from PLL1_CLK1 / 8 */
+    clock_set_source_divider(clock_ref0, clk_src_pll1_clk1, 8);
+    clock_add_to_group(clock_ref0, BOARD_RUNNING_CORE & 0x1);
 
-    /* Set RMII reference clock */
-    board_init_enet_rmii_reference_clock(HPM_ENET1, BOARD_ENET_RMII_INT_REF_CLK);
-    printf("Enet1 Reference Clock: %s\n", BOARD_ENET_RMII_INT_REF_CLK ? "Internal Clock" : "External Clock");
+    clock_set_source_divider(clock_ref1, clk_src_pll1_clk1, 8);
+    clock_add_to_group(clock_ref1, BOARD_RUNNING_CORE & 0x1);
+
+    //printf("REF0 freq = %lu Hz\r\n", clock_get_frequency(clock_ref0));
+    //printf("REF1 freq = %lu Hz\r\n", clock_get_frequency(clock_ref1));
+
+    /* Enable ENET MAC peripheral clocks */
+    clock_set_source_divider(clock_eth0, clk_src_pll1_clk1, 8);
+    clock_add_to_group(clock_eth0, BOARD_RUNNING_CORE & 0x1);
+
+    clock_set_source_divider(clock_eth1, clk_src_pll1_clk1, 8);
+    clock_add_to_group(clock_eth1, BOARD_RUNNING_CORE & 0x1);
+
+    //printf("ETH0 freq = %lu Hz\r\n", clock_get_frequency(clock_eth0));
+    //printf("ETH1 freq = %lu Hz\r\n", clock_get_frequency(clock_eth1));
+
+    enet_rmii_enable_clock(HPM_ENET0, true);
+    enet_rmii_enable_clock(HPM_ENET1, true);
+
+    //printf("RMII REFCLK source: HPM internal output\r\n");
 
     return status_success;
 }
 
+// Modified for SP-920
 hpm_stat_t board_reset_multiple_enet_phy(void)
 {
+    // Reset both external KSZ8463 devices
     board_reset_enet_phy(HPM_ENET0);
     board_reset_enet_phy(HPM_ENET1);
 
     return status_success;
 }
 
+// Modified for SP-920
 hpm_stat_t board_init_enet_phy(ENET_Type *ptr)
 {
-    rtl8211_config_t phy_config0;
-    rtl8201_config_t phy_config1;
-
-    if (ptr == HPM_ENET0) {
-        rtl8211_reset(ptr, RTL8211_ADDR);
-        rtl8211_basic_mode_default_config(HPM_ENET0, &phy_config0);
-        if (rtl8211_basic_mode_init(HPM_ENET0, RTL8211_ADDR, &phy_config0) == true) {
-            return status_success;
-        } else {
-            printf("Enet0 phy init failed!\n");
-            return status_fail;
-        }
-    } else if (ptr == HPM_ENET1) {
-        rtl8201_reset(HPM_ENET1, RTL8201_ADDR);
-        rtl8201_basic_mode_default_config(HPM_ENET1, &phy_config1);
-        phy_config1.rmii_refclk_dir = BOARD_ENET_RMII_INT_REF_CLK;
-        if (rtl8201_basic_mode_init(HPM_ENET1, RTL8201_ADDR, &phy_config1) == true) {
-            return status_success;
-        } else {
-            printf("Enet1 phy init failed!\n");
-            return status_fail;
-        }
-    } else {
-         return status_invalid_argument;
+    /* 
+     * SP-920 does not use a classic external PHY accessed by MDIO from HPM.
+     * The external KSZ8463 switches are configured separately over SPI.
+     *
+     * Keep this function as a successful stub because the HPM lwIP sample
+     * still expects board_init_enet_phy() to exist and return success.
+     */
+    if ((ptr != HPM_ENET0) && (ptr != HPM_ENET1)) {
+        return status_invalid_argument;
     }
+
+    return status_success;
 }
 
 ENET_Type *board_get_enet_base(uint8_t idx)
@@ -1269,23 +1323,75 @@ ENET_Type *board_get_enet_base(uint8_t idx)
     }
 }
 
+// Modified for SP-920
 uint8_t board_get_enet_phy_itf(uint8_t idx)
 {
-    if (idx == 0) {
-        return BOARD_ENET_RGMII_PHY_ITF;
-    } else {
-        return BOARD_ENET_RMII_PHY_ITF;
-    }
+    (void) idx;
+
+    // Both interfaces are RMII on SP-920
+    return enet_inf_rmii;
 }
 
 void board_get_enet_phy_status(uint8_t idx, void *status)
 {
-    if (idx == 0) {
-        rtl8211_get_phy_status(HPM_ENET0, RTL8211_ADDR, status);
-    } else {
-        rtl8201_get_phy_status(HPM_ENET1, RTL8201_ADDR, status);
+    enet_phy_status_t *phy_status = (enet_phy_status_t *)status;
+    bool link_up = false;
+
+    if (phy_status == NULL) {
+        return;
     }
+
+    memset(phy_status, 0, sizeof(*phy_status));
+
+    // Read current link state from the corresponding KSZ8463 device
+    if (ksz8463_get_link_status(idx, &link_up) != status_success) {
+        phy_status->enet_phy_link = enet_phy_link_down;
+        phy_status->enet_phy_speed = enet_phy_port_speed_100mbps;
+        phy_status->enet_phy_duplex = enet_phy_duplex_full;
+        return;
+    }
+
+    phy_status->enet_phy_link = link_up ? enet_phy_link_up : enet_phy_link_down;
+
+    // In fiber mode on this board we expect 100 Mbps full duplex
+    phy_status->enet_phy_speed = enet_phy_port_speed_100mbps;
+    phy_status->enet_phy_duplex = enet_phy_duplex_full;
 }
+
+// Added for SP-920
+void board_init_ksz_spi_pins(void)
+{
+    // SPI0 signals used by both KSZ8463 devices
+    init_spi0_pins();
+    init_spi_eth_cs_pins();
+}
+
+void board_init_ksz_ctrl_pins(void)
+{
+    init_ksz_reset_pins();
+    init_ksz_interrupt_pins();
+
+    //printf("Configure KSZ reset pins as GPIO outputs, initial LOW\r\n");
+
+    gpio_set_pin_output_with_initial(BOARD_KSZ0_RST_GPIO,
+                                     BOARD_KSZ0_RST_GPIO_INDEX,
+                                     BOARD_KSZ0_RST_GPIO_PIN,
+                                     0);
+
+    gpio_set_pin_output_with_initial(BOARD_KSZ1_RST_GPIO,
+                                     BOARD_KSZ1_RST_GPIO_INDEX,
+                                     BOARD_KSZ1_RST_GPIO_PIN,
+                                     0);
+
+    gpio_set_pin_input(BOARD_KSZ0_INT_GPIO,
+                       BOARD_KSZ0_INT_GPIO_INDEX,
+                       BOARD_KSZ0_INT_GPIO_PIN);
+
+    gpio_set_pin_input(BOARD_KSZ1_INT_GPIO,
+                       BOARD_KSZ1_INT_GPIO_INDEX,
+                       BOARD_KSZ1_INT_GPIO_PIN);
+}
+
 #endif
 
 void board_init_dao_pins(void)
@@ -1350,6 +1456,8 @@ void init_uart_pins(UART_Type *ptr)
         init_uart2_pins();
     } else if (ptr == HPM_UART3) {
         init_uart3_pins();
+    } else if (ptr == HPM_UART7) {
+        init_uart7_pins();
     } else if (ptr == HPM_UART13) {
         init_uart13_pins();
     } else if (ptr == HPM_PUART) {
@@ -1407,14 +1515,19 @@ void init_gpio_pins(void)
 
 void init_spi_pins(SPI_Type *ptr)
 {
-    if (ptr == HPM_SPI2) {
+    if (ptr == HPM_SPI0) {
+        init_spi0_pins();
+    } else if (ptr == HPM_SPI2) {
         init_spi2_pins();
     }
 }
 
 void init_spi_pins_with_gpio_as_cs(SPI_Type *ptr)
 {
-    if (ptr == HPM_SPI2) {
+    if (ptr == HPM_SPI0) {
+        init_spi0_pins();
+        init_spi_eth_cs_pins();
+    } else if (ptr == HPM_SPI2) {
         init_spi2_pins_with_gpio_as_cs();
     }
 }
@@ -1570,6 +1683,7 @@ void init_gptmr_channel_pin(GPTMR_Type *ptr, uint32_t channel, bool as_output)
         }
     }
 }
+
 void board_init_brownout_indicate_pin(void)
 {
     init_brownout_indicate_pin();

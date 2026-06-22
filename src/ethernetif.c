@@ -1,0 +1,713 @@
+/**
+* @file
+* Ethernet Interface Skeleton
+*
+*/
+
+/*
+* Copyright (c) 2001-2004 Swedish Institute of Computer Science.
+* All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without modification,
+* are permitted provided that the following conditions are met:
+*
+* 1. Redistributions of source code must retain the above copyright notice,
+*    this list of conditions and the following disclaimer.
+* 2. Redistributions in binary form must reproduce the above copyright notice,
+*    this list of conditions and the following disclaimer in the documentation
+*    and/or other materials provided with the distribution.
+* 3. The name of the author may not be used to endorse or promote products
+*    derived from this software without specific prior written permission.
+*
+* THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR IMPLIED
+* WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+* MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT
+* SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+* EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT
+* OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+* INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+* CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+* IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
+* OF SUCH DAMAGE.
+*
+* This file is part of the lwIP TCP/IP stack.
+*
+* Author: Adam Dunkels <adam@sics.se>
+*
+*/
+
+/*
+* This file is a skeleton for developing Ethernet network interface
+* drivers for lwIP. Add code to the low_level functions and do a
+* search-and-replace for the word "ethernetif" to replace it with
+* something that better describes your network interface.
+*/
+
+/*
+ * Copyright (c) 2023-2025 HPMicro
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ */
+
+/*
+ * Source:
+ * hpm_sdk/samples/lwip/ports/baremetal/multiple/ethernetif.c
+ */
+
+#include "common.h"
+#include "lwip/opt.h"
+#include "lwip/def.h"
+#include "lwip/mem.h"
+#include "lwip/pbuf.h"
+#include "netif/etharp.h"
+#include "lwip/err.h"
+#include "lwip/timeouts.h"
+#include "ethernetif.h"
+#include "hpm_enet_drv.h"
+#include "board.h"
+#include "netconf.h"
+#include <string.h>
+#include "lwip/netif.h"
+#include "lwip/sys.h"
+
+#if defined(NO_SYS) && !NO_SYS
+#include "FreeRTOS.h"
+#include "semphr.h"
+#endif
+
+#define netifMTU                           (1500)
+#define netifINTERFACE_TASK_STACK_SIZE     (1024)
+#define netifINTERFACE_TASK_PRIORITY       (configMAX_PRIORITIES - 1)
+#define netifGUARD_BLOCK_TIME              (250)
+
+/* The time to block waiting for input. */
+#define emacBLOCK_TIME_WAITING_FOR_INPUT   ((portTickType)100)
+
+/* Define those to better describe your network interface. */
+#define IFNAME0 'e'
+#define IFNAME1 'n'
+
+#if defined(NO_SYS) && !NO_SYS
+static struct netif *s_pxNetIf;
+static struct netif *s_pxNetIF1;
+xSemaphoreHandle s_xSemaphore;
+#endif
+
+static volatile uint32_t dbg_rx_ok[BOARD_ENET_COUNT];
+static volatile uint32_t dbg_rx_pbuf_alloc_fail[BOARD_ENET_COUNT];
+static volatile uint32_t dbg_rx_custom_pbuf_alloc_fail[BOARD_ENET_COUNT];
+static volatile uint32_t dbg_tx_ok[BOARD_ENET_COUNT];
+static volatile uint32_t dbg_tx_busy[BOARD_ENET_COUNT];
+
+LWIP_MEMPOOL_DECLARE(enet0_rx_pool, ENET_RX_BUFF_COUNT, sizeof(my_custom_pbuf_t), "Custom RX PBUF pool");
+LWIP_MEMPOOL_DECLARE(enet1_rx_pool, ENET_RX_BUFF_COUNT, sizeof(my_custom_pbuf_t), "Custom RX PBUF pool");
+
+void ethernetif_debug_print_stats(void)
+{
+    printf("ENET stats: "
+           "rx0=%lu tx0=%lu txbusy0=%lu pbuf_fail0=%lu custom_fail0=%lu | "
+           "rx1=%lu tx1=%lu txbusy1=%lu pbuf_fail1=%lu custom_fail1=%lu\r\n",
+           dbg_rx_ok[0], dbg_tx_ok[0], dbg_tx_busy[0],
+           dbg_rx_pbuf_alloc_fail[0], dbg_rx_custom_pbuf_alloc_fail[0],
+           dbg_rx_ok[1], dbg_tx_ok[1], dbg_tx_busy[1],
+           dbg_rx_pbuf_alloc_fail[1], dbg_rx_custom_pbuf_alloc_fail[1]);
+}
+
+static void debug_print_eth_frame(struct netif *netif, struct pbuf *p)
+{
+    uint8_t *d = (uint8_t *)p->payload;
+
+    if (p->len < 14) {
+        return;
+    }
+
+    uint16_t eth_type = ((uint16_t)d[12] << 8) | d[13];
+
+    if (eth_type == 0x0806) {
+        printf("NETIF%d RX ARP len=%u\r\n", netif->num, p->tot_len);
+    } else if (eth_type == 0x0800 && p->len >= 34) {
+        uint8_t proto = d[23];
+
+        printf("NETIF%d RX IPv4 proto=%u src=%u.%u.%u.%u dst=%u.%u.%u.%u len=%u\r\n",
+               netif->num,
+               proto,
+               d[26], d[27], d[28], d[29],
+               d[30], d[31], d[32], d[33],
+               p->tot_len);
+
+        if (proto == 1 && p->len >= 42) {
+            printf("NETIF%d RX ICMP type=%u code=%u\r\n",
+                   netif->num,
+                   d[34], d[35]);
+        }
+    }
+}
+
+static void enet_cache_invalidate_safe(uint32_t addr, uint32_t size)
+{
+    uint32_t aligned_addr;
+    uint32_t aligned_size;
+
+    aligned_addr = addr & ~(HPM_L1C_CACHELINE_SIZE - 1U);
+    aligned_size = size + (addr - aligned_addr);
+    aligned_size = (aligned_size + HPM_L1C_CACHELINE_SIZE - 1U) &
+                   ~(HPM_L1C_CACHELINE_SIZE - 1U);
+
+    l1c_dc_invalidate(aligned_addr, aligned_size);
+}
+
+static void enet_cache_writeback_safe(uint32_t addr, uint32_t size)
+{
+    uint32_t aligned_addr;
+    uint32_t aligned_size;
+
+    aligned_addr = addr & ~(HPM_L1C_CACHELINE_SIZE - 1U);
+    aligned_size = size + (addr - aligned_addr);
+    aligned_size = (aligned_size + HPM_L1C_CACHELINE_SIZE - 1U) &
+                   ~(HPM_L1C_CACHELINE_SIZE - 1U);
+
+    l1c_dc_writeback(aligned_addr, aligned_size);
+}
+
+/**
+* In this function, the hardware should be initialized.
+* Called from ethernetif_init().
+*
+* @param netif the already initialized lwip network interface structure
+*        for this ethernetif
+*/
+static void low_level_init(struct netif *netif)
+{
+    /* Set netif MAC hardware address length */
+    netif->hwaddr_len = ETHARP_HWADDR_LEN;
+
+    /* Set netif MAC hardware address */
+    memcpy(netif->hwaddr, mac[netif->num], ETH_HWADDR_LEN);
+
+    /* Set netif maximum transfer unit */
+    netif->mtu = netifMTU;
+
+    /* Accept broadcast address and ARP traffic */
+    netif->flags |= NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_IGMP;
+
+    LWIP_MEMPOOL_INIT(enet0_rx_pool);
+    LWIP_MEMPOOL_INIT(enet1_rx_pool);
+
+#if defined(NO_SYS) && !NO_SYS
+    s_pxNetIf = netif;
+
+    /* create binary semaphore used for informing ethernetif of frame reception */
+    if (s_xSemaphore == NULL) {
+        vSemaphoreCreateBinary(s_xSemaphore);
+        xSemaphoreTake(s_xSemaphore, 0);
+    }
+    /* create the task that handles the ETH_MAC */
+    xTaskCreate(ethernetif_input, "Eth_if", netifINTERFACE_TASK_STACK_SIZE, NULL,
+                netifINTERFACE_TASK_PRIORITY, NULL);
+#endif
+}
+
+static uint16_t checksum16(const uint8_t *data, uint16_t len)
+{
+    uint32_t sum = 0;
+
+    while (len > 1) {
+        sum += ((uint16_t)data[0] << 8) | data[1];
+        data += 2;
+        len -= 2;
+    }
+
+    if (len > 0) {
+        sum += ((uint16_t)data[0] << 8);
+    }
+
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    return (uint16_t)(~sum);
+}
+
+static void fix_icmp_checksum(struct pbuf *p)
+{
+    uint8_t *d = (uint8_t *)p->payload;
+
+    if (p->len < 42) {
+        return;
+    }
+
+    uint16_t eth_type = ((uint16_t)d[12] << 8) | d[13];
+    if (eth_type != 0x0800) {
+        return;
+    }
+
+    uint8_t ip_header_len = (d[14] & 0x0F) * 4;
+    uint8_t proto = d[23];
+
+    if (proto != 1) {
+        return;
+    }
+
+    uint16_t ip_total_len = ((uint16_t)d[16] << 8) | d[17];
+    uint16_t icmp_offset = 14 + ip_header_len;
+    uint16_t icmp_len = ip_total_len - ip_header_len;
+
+    if (p->len < icmp_offset + icmp_len) {
+        return;
+    }
+
+    d[icmp_offset + 2] = 0;
+    d[icmp_offset + 3] = 0;
+
+    uint16_t csum = checksum16(&d[icmp_offset], icmp_len);
+
+    d[icmp_offset + 2] = (uint8_t)(csum >> 8);
+    d[icmp_offset + 3] = (uint8_t)(csum & 0xFF);
+
+    printf("ICMP checksum fixed: 0x%04x\r\n", csum);
+}
+
+static void fix_icmp_checksum_in_tx_buffer(uint8_t *d, uint16_t frame_len)
+{
+    if (frame_len < 42) {
+        return;
+    }
+
+    uint16_t eth_type = ((uint16_t)d[12] << 8) | d[13];
+    if (eth_type != 0x0800) {
+        return;
+    }
+
+    uint8_t ip_header_len = (d[14] & 0x0F) * 4;
+    uint8_t proto = d[23];
+
+    if (proto != 1) {
+        return;
+    }
+
+    uint16_t ip_total_len = ((uint16_t)d[16] << 8) | d[17];
+    uint16_t icmp_offset = 14 + ip_header_len;
+    uint16_t icmp_len = ip_total_len - ip_header_len;
+
+    if (frame_len < icmp_offset + icmp_len) {
+        return;
+    }
+
+    d[icmp_offset + 2] = 0;
+    d[icmp_offset + 3] = 0;
+
+    uint16_t csum = checksum16(&d[icmp_offset], icmp_len);
+
+    d[icmp_offset + 2] = (uint8_t)(csum >> 8);
+    d[icmp_offset + 3] = (uint8_t)(csum & 0xFF);
+}
+
+/**
+* This function should do the actual transmission of the packet. The packet is
+* contained in the pbuf that is passed to the function. This pbuf
+* might be chained.
+*
+* @param netif the lwip network interface structure for this ethernetif
+* @param p the MAC packet to send (e.g. IP packet including MAC addresses and type)
+* @return ERR_OK if the packet could be sent
+*         an err_t value if the packet couldn't be sent
+*
+* @note Returning ERR_MEM here if a DMA queue of your MAC is full can lead to
+*       strange results. You might consider waiting for space in the DMA queue
+*       to become available since the stack doesn't retry to send a packet
+*       dropped because of memory failure (except for the TCP timers).
+*/
+
+static err_t low_level_output(struct netif *netif, struct pbuf *p)
+{
+#if defined(NO_SYS) && !NO_SYS
+    static xSemaphoreHandle xTxSemaphore = NULL;
+#endif
+
+    struct pbuf *q;
+    uint8_t *buffer;
+    __IO enet_tx_desc_t *dma_tx_desc;
+    uint16_t frame_length = 0;
+    uint32_t buffer_offset = 0;
+    uint32_t bytes_left_to_copy = 0;
+    uint32_t payload_offset = 0;
+    enet_tx_desc_t  *tx_desc_list_cur;
+    enet_base_t *base = (enet_base_t *)board_get_enet_base(netif->num);
+
+    uint8_t *tx_buffer_start;
+
+    if (netif == NULL || p == NULL) {
+        return ERR_VAL;
+    }
+
+    //fix_icmp_checksum(p);
+
+    
+
+    tx_desc_list_cur = desc[netif->num].tx_desc_list_cur;
+
+#if defined(LWIP_PTP) && LWIP_PTP
+    enet_ptp_ts_system_t timestamp;
+#endif
+
+#if defined(NO_SYS) && !NO_SYS
+    if (xTxSemaphore == NULL) {
+        vSemaphoreCreateBinary(xTxSemaphore);
+    }
+
+    if (xSemaphoreTake(xTxSemaphore, netifGUARD_BLOCK_TIME)) {
+#endif
+        dma_tx_desc = tx_desc_list_cur;
+        buffer = (uint8_t *)(dma_tx_desc->tdes2_bm.buffer1);
+        tx_buffer_start = buffer;
+        buffer_offset = 0;
+
+        for (q = p; q != NULL; q = q->next) {
+            /* Get bytes in current lwIP buffer  */
+            bytes_left_to_copy = q->len;
+            payload_offset = 0;
+
+
+            if (dma_tx_desc->tdes0_bm.own != 0) {
+                dbg_tx_busy[netif->num]++;
+                return ERR_INPROGRESS;
+            }
+
+            /* Check if the length of data to copy is bigger than Tx buffer size*/
+            while ((bytes_left_to_copy + buffer_offset) > ENET_TX_BUFF_SIZE) {
+                /* Copy data to Tx buffer*/
+                memcpy((uint8_t *)((uint8_t *)buffer + buffer_offset),
+                    (uint8_t *)((uint8_t *)q->payload + payload_offset),
+                            ENET_TX_BUFF_SIZE - buffer_offset);
+
+                /* Point to next descriptor */
+                dma_tx_desc = (enet_tx_desc_t *)(dma_tx_desc->tdes3_bm.next_desc);
+
+                /* Check if the buffer is available */
+                if (dma_tx_desc->tdes0_bm.own != 0) {
+                    dbg_tx_busy[netif->num]++;
+                    return ERR_INPROGRESS;
+                }
+
+                buffer = (uint8_t *)(dma_tx_desc->tdes2_bm.buffer1);
+
+                bytes_left_to_copy = bytes_left_to_copy - (ENET_TX_BUFF_SIZE - buffer_offset);
+                payload_offset = payload_offset + (ENET_TX_BUFF_SIZE - buffer_offset);
+                frame_length = frame_length + (ENET_TX_BUFF_SIZE - buffer_offset);
+                buffer_offset = 0;
+            }
+
+            /* pass payload to buffer */
+            //desc[netif->num].tx_desc_list_cur->tdes2_bm.buffer1 = core_local_mem_to_sys_address(BOARD_RUNNING_CORE, (uint32_t)q->payload);
+            memcpy((uint8_t *)buffer + buffer_offset, (uint8_t *)q->payload, bytes_left_to_copy);
+
+            buffer_offset = buffer_offset + bytes_left_to_copy;
+            frame_length = frame_length + bytes_left_to_copy;
+        }
+        fix_icmp_checksum_in_tx_buffer(tx_buffer_start, frame_length);
+
+        /* Prepare transmit descriptors to give to DMA*/
+        frame_length += 4;
+        //l1c_dc_writeback(((uint32_t)p->payload + (MEM_ALIGNMENT - 1)) & ~(MEM_ALIGNMENT - 1), ENET_TX_BUFF_SIZE);
+        //enet_cache_writeback_safe((uint32_t)p->payload, ENET_TX_BUFF_SIZE);
+        //enet_cache_writeback_safe((uint32_t)buffer, ENET_TX_BUFF_SIZE);
+        enet_cache_writeback_safe((uint32_t)tx_buffer_start, ENET_TX_BUFF_SIZE);
+
+        #if defined(LWIP_PTP) && LWIP_PTP
+            enet_prepare_tx_desc_with_ts_record(base, &desc[netif->num].tx_desc_list_cur, &desc[netif->num].tx_control_config, frame_length, desc.tx_buff_cfg.size, &timestamp);
+            /* Get the transmit timestamp */
+            p->time_sec  = timestamp.sec;
+            p->time_nsec = timestamp.nsec;
+        #else
+            //printf("NETIF%d prepare TX: len=%u buffer=0x%08lx\r\n", netif->num, frame_length, (uint32_t)buffer);
+            enet_prepare_tx_desc(base, &desc[netif->num].tx_desc_list_cur, &desc[netif->num].tx_control_config, frame_length, desc[netif->num].tx_buff_cfg.size);
+            //printf("NETIF%d TX desc prepared\r\n", netif->num);
+        #endif
+
+#if defined(NO_SYS) && !NO_SYS
+        /* Give semaphore and exit */
+        xSemaphoreGive(xTxSemaphore);
+    }
+#endif
+    //printf("NETIF%d TX frame len=%u\r\n", netif->num, p->tot_len);
+
+    dbg_tx_ok[netif->num]++;
+
+    return ERR_OK;
+}
+
+void free_rx_dma_descriptor(void *p)
+{
+    enet_frame_t *frame;
+
+    frame = (enet_frame_t *)p;
+
+    /* Set Own bit in Rx descriptors: gives the buffers back to DMA */
+    enet_rx_desc_t *dma_rx_desc = frame->rx_desc;
+
+    for (uint32_t i = 0; i < frame->seg; i++) {
+        dma_rx_desc->rdes0_bm.own = 1;
+        dma_rx_desc = (enet_rx_desc_t *)(dma_rx_desc->rdes3_bm.next_desc);
+    }
+
+    /* Clear Segment_Count */
+    frame->seg = 0;
+    frame->used = 0;
+    frame->length = 0;
+}
+
+void enet0_pbuf_free_custom(struct pbuf *p)
+{
+    SYS_ARCH_DECL_PROTECT(old_level);
+    my_custom_pbuf_t *my_pbuf = (my_custom_pbuf_t *)p;
+
+    SYS_ARCH_PROTECT(old_level);
+    free_rx_dma_descriptor((void *)my_pbuf->dma_descriptor);
+    LWIP_MEMPOOL_FREE(enet0_rx_pool, my_pbuf);
+    SYS_ARCH_UNPROTECT(old_level);
+}
+
+void enet1_pbuf_free_custom(struct pbuf *p)
+{
+    SYS_ARCH_DECL_PROTECT(old_level);
+    my_custom_pbuf_t *my_pbuf = (my_custom_pbuf_t *)p;
+
+    SYS_ARCH_PROTECT(old_level);
+    free_rx_dma_descriptor((void *)my_pbuf->dma_descriptor);
+    LWIP_MEMPOOL_FREE(enet1_rx_pool, my_pbuf);
+    SYS_ARCH_UNPROTECT(old_level);
+}
+
+/**
+* Should allocate a pbuf and transfer the bytes of the incoming
+* packet from the interface into the pbuf.
+*
+* @param netif the lwip network interface structure for this ethernetif
+* @return a pbuf filled with the received packet (including MAC header)
+*         NULL on memory error
+*/
+static struct pbuf *low_level_input(struct netif *netif)
+{
+    struct pbuf *p = NULL;
+    uint8_t *buffer;
+    uint32_t len;
+    my_custom_pbuf_t *my_pbuf;
+    enet_frame_pointer_t *fp = (enet_frame_pointer_t *)netif->state;
+    enet_base_t *base = (enet_base_t *)board_get_enet_base(netif->num);
+
+    if (fp->frame[fp->idx].used == 0) {
+        #if defined(__ENABLE_ENET_RECEIVE_INTERRUPT) && __ENABLE_ENET_RECEIVE_INTERRUPT || defined(NO_SYS) && !NO_SYS
+        fp->frame[fp->idx] = enet_get_received_frame_interrupt(&desc[netif->num].rx_desc_list_cur, &desc[netif->num].rx_frame_info, ENET_RX_BUFF_COUNT);
+        #else
+        if (enet_check_received_frame(&desc[netif->num].rx_desc_list_cur, &desc[netif->num].rx_frame_info) == 1) {
+            fp->frame[fp->idx] = enet_get_received_frame(&desc[netif->num].rx_desc_list_cur, &desc[netif->num].rx_frame_info);
+        }
+        #endif
+
+        /* Obtain the size of the packet and put it into the "len" variable. */
+        len = fp->frame[fp->idx].length;
+        buffer = (uint8_t *)fp->frame[fp->idx].buffer;
+
+        if (len > 0) {
+            //printf("RX frame: len=%d\r\n", len);
+            /* Allocate a pbuf chain of pbufs from the custom buffer pool */
+            fp->frame[fp->idx].used = 1;
+
+            //my_pbuf = (netif->num == 0) ? (my_custom_pbuf_t *)LWIP_MEMPOOL_ALLOC(enet0_rx_pool) : (my_custom_pbuf_t *)LWIP_MEMPOOL_ALLOC(enet1_rx_pool);
+            //my_pbuf->p.custom_free_function = (netif->num == 0) ? enet0_pbuf_free_custom : enet1_pbuf_free_custom;
+            //my_pbuf->dma_descriptor = (void *)&fp->frame[fp->idx];
+
+            my_pbuf = (netif->num == 0) ? (my_custom_pbuf_t *)LWIP_MEMPOOL_ALLOC(enet0_rx_pool) : (my_custom_pbuf_t *)LWIP_MEMPOOL_ALLOC(enet1_rx_pool);
+
+            //if (my_pbuf == NULL) {
+            //    free_rx_dma_descriptor((void *)&fp->frame[fp->idx]);
+            //    desc[netif->num].rx_frame_info.seg_count = 0;
+            //    return NULL;
+            //}
+
+            if (my_pbuf == NULL) {
+                dbg_rx_pbuf_alloc_fail[netif->num]++;
+                free_rx_dma_descriptor((void *)&fp->frame[fp->idx]);
+                fp->frame[fp->idx].used = 0;
+                fp->frame[fp->idx].length = 0;
+                fp->frame[fp->idx].seg = 0;
+                desc[netif->num].rx_frame_info.seg_count = 0;
+                return NULL;
+            }
+
+            my_pbuf->p.custom_free_function = (netif->num == 0)
+                                            ? enet0_pbuf_free_custom
+                                            : enet1_pbuf_free_custom;
+            my_pbuf->dma_descriptor = (void *)&fp->frame[fp->idx];
+
+            p = pbuf_alloced_custom(PBUF_RAW, fp->frame[fp->idx].length, PBUF_REF, &my_pbuf->p, (uint8_t *)fp->frame[fp->idx].buffer, ENET_RX_BUFF_SIZE);
+
+            if (p == NULL) {
+                free_rx_dma_descriptor((void *)&fp->frame[fp->idx]);
+
+                if (netif->num == 0) {
+                    LWIP_MEMPOOL_FREE(enet0_rx_pool, my_pbuf);
+                } else {
+                    LWIP_MEMPOOL_FREE(enet1_rx_pool, my_pbuf);
+                }
+
+                fp->frame[fp->idx].used = 0;
+                fp->frame[fp->idx].length = 0;
+                fp->frame[fp->idx].seg = 0;
+                desc[netif->num].rx_frame_info.seg_count = 0;
+                return NULL;
+            }
+
+            if (p != NULL) {
+                //l1c_dc_invalidate((uint32_t)buffer, ENET_RX_BUFF_SIZE);
+                enet_cache_invalidate_safe((uint32_t)buffer, ENET_RX_BUFF_SIZE);
+                #if defined(LWIP_PTP) && LWIP_PTP
+                /* Get the received timestamp */
+                p->time_sec  = fp->frame[fp->idx].rx_desc->rdes7_bm.rtsh;
+                p->time_nsec = fp->frame[fp->idx].rx_desc->rdes6_bm.rtsl;
+                #endif
+            }
+
+            dbg_rx_ok[netif->num]++;
+
+            ++fp->idx;
+            fp->idx %= ENET_RX_BUFF_COUNT;
+
+            /* Clear Segment_Count */
+            desc[netif->num].rx_frame_info.seg_count = 0;
+        }
+    }
+
+    /* Resume Rx Process */
+    enet_rx_resume(base);
+
+    return p;
+}
+
+/**
+* This function is the ethernetif_input task, it is processed when a packet
+* is ready to be read from the interface. It uses the function low_level_input()
+* that should handle the actual reception of bytes from the network
+* interface. Then the type of the received packet is determined and
+* the appropriate input function is called.
+*
+* @param netif the lwip network interface structure for this ethernetif
+*/
+
+ /*
+  invoked after receiving data packet
+ */
+#if defined(NO_SYS) && !NO_SYS
+void ethernetif_input(void *pvParameters)
+{
+    struct pbuf *p;
+
+    for ( ;; ) {
+        if (xSemaphoreTake(s_xSemaphore, emacBLOCK_TIME_WAITING_FOR_INPUT) == pdTRUE) {
+GET_NEXT_FRAME:
+            p = low_level_input(s_pxNetIf);
+            if (p != NULL) {
+                if (ERR_OK != s_pxNetIf->input(p, s_pxNetIf)) {
+                    pbuf_free(p);
+                } else {
+                    goto GET_NEXT_FRAME;
+                }
+            }
+        }
+    }
+}
+#else
+//err_t ethernetif_input(struct netif *netif)
+//{
+//    err_t err = ERR_OK;
+//    struct pbuf *p = NULL;
+//#if defined(__ENABLE_ENET_RECEIVE_INTERRUPT) && __ENABLE_ENET_RECEIVE_INTERRUPT
+//    if (rx_flag[netif->num]) {
+//#endif
+//        GET_NEXT_FRAME:
+//        /* move received packet into a new pbuf */
+//        p = low_level_input(netif);
+
+//        /* no packet could be read, silently ignore this */
+//        if (p == NULL) {
+//            err = ERR_MEM;
+//        } else {
+//            //debug_print_eth_frame(netif, p);
+//             /* entry point to the LwIP stack */
+//            err = netif->input(p, netif);
+
+//            if (err != ERR_OK) {
+//                LWIP_DEBUGF(NETIF_DEBUG, ("ethernetif_input: IP input error\n"));
+//                pbuf_free(p);
+//            } else {
+//                goto GET_NEXT_FRAME;
+//            }
+//        }
+//#if defined(__ENABLE_ENET_RECEIVE_INTERRUPT) && __ENABLE_ENET_RECEIVE_INTERRUPT
+//        rx_flag[netif->num] = false;
+//    }
+//#endif
+//    return err;
+//}
+err_t ethernetif_input(struct netif *netif)
+{
+    err_t err = ERR_OK;
+    struct pbuf *p = NULL;
+
+#if defined(__ENABLE_ENET_RECEIVE_INTERRUPT) && __ENABLE_ENET_RECEIVE_INTERRUPT
+    rx_flag[netif->num] = false;
+#endif
+
+    while (1) {
+        p = low_level_input(netif);
+
+        if (p == NULL) {
+            break;
+        }
+
+        err = netif->input(p, netif);
+
+        if (err != ERR_OK) {
+            LWIP_DEBUGF(NETIF_DEBUG, ("ethernetif_input: IP input error\n"));
+            pbuf_free(p);
+        }
+    }
+
+    return err;
+}
+#endif
+
+/**
+* Should be called at the beginning of the program to set up the
+* network interface. It calls the function low_level_init() to do the
+* actual setup of the hardware.
+*
+* This function should be passed as a parameter to netif_add().
+*
+* @param netif the lwip network interface structure for this ethernetif
+* @return ERR_OK if the loopif is initialized
+*         ERR_MEM if private data couldn't be allocated
+*         any other err_t on error
+*/
+err_t ethernetif_init(struct netif *netif)
+{
+  LWIP_ASSERT("netif != NULL", (netif != NULL));
+
+#if LWIP_NETIF_HOSTNAME
+    /* Initialize interface hostname */
+    netif->hostname = "lwip";
+#endif /* LWIP_NETIF_HOSTNAME */
+
+    netif->name[0] = IFNAME0;
+    netif->name[1] = netif->num + '0';
+    netif->output = etharp_output;
+    netif->linkoutput = low_level_output;
+
+    /* initialize the hardware */
+    low_level_init(netif);
+
+    etharp_init();
+
+    return ERR_OK;
+}

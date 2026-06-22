@@ -1,73 +1,59 @@
-#include <stdio.h>
-#include "board.h"
+/*
+ * Main entry point for the SP-920 application.
+ */
 
+#include <stdio.h>
+
+#include "board.h"
+#include "ksz8463.h"
+#include "lwip.h"
 #include "ram_test.h"
 #include "read_mac.h"
 #include "rs485.h"
 #include "clock_test.h"
+#include "apm_uart_test.h"
 
-static void print_menu(void)
-{
-    printf("\r\n============================\r\n");
-    printf("Select task:\r\n");
-    printf("1 - RAM test\r\n");
-    printf("2 - Read MAC\r\n");
-    printf("3 - RS485 test\r\n");
-    printf("4 - Clock test\r\n");
-    printf("a - Run all tasks\r\n");
-    printf("============================\r\n");
-    printf("> ");
-}
+#define RUN_RAM_TEST        1
+#define RUN_READ_MAC        1
+#define RUN_RS485_TEST      1
+#define RUN_CLOCK_TEST      1
+#define RUN_APM_UART_TEST   0
+
+#define RUN_KSZ_SPI_TEST    0
+#define RUN_LWIP_TCP_ECHO   1
 
 int main(void)
 {
     board_init();
 
-    print_menu();
+#if RUN_RAM_TEST
+    ram_test_run();
+#endif
 
-    while (1)
-    {
-        int ch = getchar();
+#if RUN_READ_MAC
+    read_mac_run();
+#endif
 
-        if (ch == '\r' || ch == '\n') {
-            continue;
-        }
+#if RUN_RS485_TEST
+    rs485_run();
+#endif
 
-        switch (ch)
-        {
-            case '1':
-                ram_test_run();
-                break;
+#if RUN_CLOCK_TEST
+    clock_test_run();
+#endif
 
-            case '2':
-                read_mac_run();
-                break;
+#if RUN_APM_UART_TEST
+    apm_uart_test_run();
+#endif
 
-            case '3':
-                rs485_run();
-                break;
+#if RUN_KSZ_SPI_TEST
+    return (ksz8463_bringup_test() == status_success) ? 0 : -1;
+#endif
 
-            case '4':
-                clock_test_run();
-                break;
+#if RUN_LWIP_TCP_ECHO
+    return lwip_main();
+#endif
 
-            case 'a':
-            case 'A':
-                printf("\r\n--- RUN ALL TASKS ---\r\n");
-
-                ram_test_run();
-                read_mac_run();
-                rs485_run();
-                clock_test_run();
-
-                printf("\r\nALL TASKS COMPLETED\r\n");
-                break;
-
-            default:
-                printf("\r\nUnknown key '%c'\r\n", (char)ch);
-                break;
-        }
-
-        print_menu();
+    while (1) {
     }
 }
